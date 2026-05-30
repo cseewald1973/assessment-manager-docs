@@ -173,7 +173,8 @@ assessment-app/
 │   │   ├── useTeacherProfile.js   ← fetch/save teacher profile (grades/classes/subjects)
 │   │   ├── useConflictChecker.js  ← rule engine (reads live settings)
 │   │   ├── useArchive.js          ← archive trigger detection, export, clear, log
-│   │   ├── useConfirmation.js     ← fetch/manage confirmation state per grade per term
+│   │   ├── useConfirmation.js     ← fetch/manage teacher confirmation state per grade per term
+│   │   ├── useCycleTestConfirmations.js ← fetch/manage cycle test confirmation per grade per term
 │   │   ├── useTermGrid.js         ← computes grade-scoped week columns and cell data
 │   │   └── useGraph.js            ← Graph API wrapper
 │   ├── utils/
@@ -814,6 +815,52 @@ on first login via the TeacherProfile screen.
 
 This list starts empty. Rows are created by the app when a teacher
 first views the Confirm Schedule screen for a grade/term combination.
+
+## List 11: CycleTestConfirmations  ← CYCLE TEST SCHEDULE CONFIRMATION
+
+**SharePoint List Name:** `CycleTestConfirmations`
+
+# One row per grade per term.
+# Written when Management confirms the cycle test schedule for a grade.
+# Until a grade's cycle tests are confirmed, teachers CANNOT book any
+# assessments for that grade — the booking form is locked.
+# Teachers can still VIEW cycle test dates on the calendar at all times.
+#
+# WORKFLOW:
+# 1. Management enters all cycle test dates for a grade via CycleTestManager
+# 2. Management clicks "Confirm Grade X Cycle Tests" on CycleTestManager
+# 3. A CycleTestConfirmations row is created/updated for that grade + term
+# 4. Teachers see a login notification: "Grade X cycle tests confirmed"
+# 5. Booking is now open for that grade
+#
+# If Management needs to change a cycle test after confirming:
+# 1. Management un-confirms (IsConfirmed → false)
+# 2. Teachers immediately see "Grade X cycle tests not yet confirmed"
+#    and booking is blocked again for that grade
+# 3. Management edits the cycle test date
+# 4. Management re-confirms → booking re-opens
+#
+# STALE:
+# If a cycle test is added, edited, or deleted after confirmation,
+# IsStale is set to true automatically. Management must re-confirm.
+
+| Column Name      | Type          | Required | Notes                                                              |
+|------------------|---------------|----------|--------------------------------------------------------------------|
+| Title            | Single line   | Yes      | Auto-set e.g. "Grade 10 — Term 1 2026 — Cycle Test Schedule"      |
+| Grade            | Single line   | Yes      | e.g. "Grade 10"                                                    |
+| Term             | Single line   | Yes      | e.g. "Term 1 2026" — matches SchoolCalendar Title                  |
+| IsConfirmed      | Yes/No        | Yes      | True when Management has confirmed cycle tests for this grade/term |
+| ConfirmedAt      | Date and Time | No       | Timestamp of confirmation                                          |
+| ConfirmedBy      | Single line   | No       | Display name of Management user who confirmed                      |
+| CycleTestCount   | Number        | Yes      | Number of cycle tests for this grade at time of confirmation       |
+| IsStale          | Yes/No        | Yes      | True if cycle tests were changed after confirmation                |
+| UnconfirmedAt    | Date and Time | No       | Timestamp if Management un-confirmed                               |
+| UnconfirmedBy    | Single line   | No       | Display name of user who un-confirmed                              |
+| Created          | Date and Time | Auto     | SharePoint creates automatically                                   |
+| Modified         | Date and Time | Auto     | SharePoint creates automatically                                   |
+
+This list starts empty. Rows are created/updated by CycleTestManager
+when Management confirms or un-confirms a grade's cycle test schedule.
 
 # ══════════════════════════════════════════════════════════════════
 # SECTION 4: MICROSOFT AZURE APP REGISTRATION
@@ -1511,7 +1558,32 @@ export function useTeacherProfile()
   other teachers' assessments are read-only (lock icon on hover)
 - Today button: jumps to the month containing today within the term
 
-### Edge Cases — Handle Gracefully
+### Login Notification Banner (shown on first screen after login)
+
+When a teacher logs in, a notification banner appears below the nav bar
+showing the cycle test confirmation status for each grade they teach:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Cycle test schedule status for your grades:                     │
+│  ✅ Grade 10 — confirmed, booking open                          │
+│  ⚠️  Grade 11 — not yet confirmed, booking blocked              │
+│  ✅ Grade 12 — confirmed, booking open                          │
+│                                          [Dismiss for this session] │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+- Green row = confirmed, teacher can book for that grade
+- Amber row = not confirmed, booking blocked for that grade
+- Banner is dismissible for the session but reappears on next login
+- If ALL grades are confirmed, banner shows a single green line:
+  "✅ All your cycle tests are confirmed — booking is open"
+- If ALL grades are confirmed, banner auto-dismisses after 5 seconds
+
+**Management NavBar badge:**
+- A red dot appears on the "Cycle Tests" nav item when any grade in
+  the current term has unconfirmed or stale cycle tests
+- Cleared when all grades are confirmed
 
 **Edge Case 1: Today is between terms (school holiday)**
 When today does not fall within any active SchoolCalendar term window:
@@ -1586,8 +1658,15 @@ Slides in from the right side of the left panel when triggered.
 Term grid remains visible behind the form.
 
 **Grade-aware field scoping:**
-- Class/Group dropdown: shows ONLY the classes the teacher teaches
-  in the currently selected grade (from their TeacherProfile)
+- Class/Group: **multi-select checkbox list** showing ONLY the classes
+  the teacher teaches in the currently selected grade (from TeacherProfile).
+  Teacher can tick one or multiple classes (e.g. 10A + 10B + 10C).
+  One assessment record is created per selected class on save.
+  The conflict check runs independently for each selected class.
+  If one class has a conflict, that class is skipped and a warning shown —
+  the other classes save successfully.
+  Example warning: "10A was skipped — already has 2 assessments on this day.
+  10B and 10C were saved successfully."
 - Subject dropdown: shows ONLY the subjects from the teacher's profile
 - Date picker: constrained to the current term window only —
   dates outside the term are greyed and unselectable
@@ -1598,6 +1677,31 @@ Term grid remains visible behind the form.
   Save button is disabled if the note exceeds 300 characters.
   validateBooking() also enforces the 300-character limit server-side
   as a safety check before the Graph API write.
+
+**Cycle test confirmation gate (checked before anything else):**
+
+Before the teacher can interact with the booking form at all, the app
+checks whether the selected grade's cycle tests have been confirmed
+for the current term in CycleTestConfirmations.
+
+If NOT confirmed:
+- Date picker is disabled (greyed out)
+- Class/Group multi-select is disabled
+- Save button is disabled
+- A prominent banner appears at the top of the form:
+  "🔒 Cycle tests for Grade 10 have not been confirmed yet.
+   Dates may still change. Contact management to confirm
+   before bookings open for this grade."
+- The banner links to the CycleTestManager for Admins/Management
+
+If confirmed but STALE (cycle test changed after confirmation):
+- Same locked state as above
+- Banner message: "⚠️ The Grade 10 cycle test schedule has changed
+   since it was last confirmed. Management must re-confirm before
+   bookings can continue."
+
+Admins and Management are NEVER blocked by this gate — they can
+always book regardless of confirmation status.
 
 **Live daily limit indicator (fires the moment Class/Group AND Date are both selected):**
 
@@ -1888,39 +1992,83 @@ When a rule value is changed, add a clear notice:
 # Admins and Management enter individual cycle test dates here.
 # Each entry is ONE test on ONE specific date for ONE grade.
 # Head office exams are NOT entered here — only school-run cycle tests.
-# The rule engine uses these dates to block bookings on that specific day.
-# Teachers can still book continuous assessments on OTHER days in the same week.
+#
+# CRITICAL WORKFLOW:
+# Teachers CANNOT book assessments for a grade until Management has
+# confirmed the cycle test schedule for that grade.
+# This ensures teachers plan around finalised cycle test dates.
+#
+# The screen is organised by grade — each grade has its own section
+# showing its cycle tests and a confirmation button at the bottom.
 
 ### Layout
 
 **Info banner at top:**
-> ℹ️ Enter each cycle test individually. Teachers can still book assignments,
-> practicals, and other assessments on other days in the same week.
-> Only the specific date entered here is blocked for new bookings.
+> ℹ️ Enter each cycle test individually. Teachers can still book
+> assignments, practicals, and other assessments on other days in
+> the same week. Only the specific date entered here is blocked.
+> Confirm each grade's cycle tests when the schedule is finalised
+> to open bookings for that grade.
 
-**Table of existing cycle tests** (sorted by date ascending):
+**One collapsible section per grade (Grade 8 through Grade 12):**
 
-| Date | Grade | Subject | Notes | Actions |
-|------|-------|---------|-------|---------|
-| Thu 5 Mar 2026 | Grade 10 | Mathematics | — | Edit · Delete |
-| Fri 6 Mar 2026 | Grade 11 | Mathematics | — | Edit · Delete |
-| Thu 12 Mar 2026 | Grade 10 | Physical Sciences | — | Edit · Delete |
+```
+GRADE 10                                          [+ Add Cycle Test]
+──────────────────────────────────────────────────────────────────
+  DATE          SUBJECT           NOTES           ACTIONS
+  Thu 5 Mar     Mathematics       —               Edit  Delete
+  Thu 12 Mar    Physical Sciences —               Edit  Delete
 
-**Add New Cycle Test button** — opens a slide-in form:
-- Date picker (constrained to current school calendar term)
-- Grade dropdown (from ReferenceData — ClassGroup categories, distinct grades)
-- Subject dropdown (from ReferenceData — Subject category) — optional
-- Notes text field — optional
-- Save button
+  ✓ Confirmed on Thu 5 Mar 2026 at 09:14 by Mr D. van Wyk
+  [Reopen Grade 10 Cycle Tests]  ← secondary button
 
-**On save:** the calendar immediately shows that date in rose for the affected grade.
-Teachers attempting to book on that day see: "A cycle test is scheduled for
-[Grade] on this date. Bookings are blocked for this day."
+──────────────────────────────────────────────────────────────────
+GRADE 11                                          [+ Add Cycle Test]
+──────────────────────────────────────────────────────────────────
+  DATE          SUBJECT           NOTES           ACTIONS
+  Fri 6 Mar     Mathematics       —               Edit  Delete
 
-**Calendar view tab:**
-- Shows all cycle test dates in the current term laid out on a mini calendar
-- Useful for spotting clashes between grades in the same week
+  ⚠ Not yet confirmed — teachers cannot book Grade 11 assessments
+  [✓ Confirm Grade 11 Cycle Tests]  ← primary cobalt button
+──────────────────────────────────────────────────────────────────
+```
+
+**Confirmation button states per grade:**
+
+Not confirmed:
+  Primary blue button: "✓ Confirm Grade X Cycle Tests"
+  Warning text: "Teachers cannot book until this is confirmed"
+
+Confirmed:
+  Green confirmed badge: "✓ Confirmed [date] by [name]"
+  Secondary grey button: "Reopen Grade X Cycle Tests"
+
+Stale (cycle test changed after confirmation):
+  Amber badge: "⚠ Re-confirmation needed"
+  Primary button: "✓ Re-confirm Grade X Cycle Tests"
+
+**On confirm:**
+- Creates/updates CycleTestConfirmations row for that grade + term
+- IsConfirmed = true, ConfirmedAt = now, CycleTestCount = current count
+- All teachers who teach that grade immediately see login notification:
+  "✅ Grade X cycle tests confirmed — booking is now open"
+- NavBar red dot for that grade is cleared
+
+**On reopen (un-confirm):**
+- IsConfirmed = false in CycleTestConfirmations
+- Teachers immediately see: "⚠ Grade X cycle tests not yet confirmed"
+- Booking is blocked again for that grade immediately
+
+**On any cycle test edit/delete after confirmation:**
+- IsStale = true automatically
+- Grade section shows amber "Re-confirmation needed" badge
+- Teachers see stale warning and booking is blocked
+
+**Calendar View tab:**
+- Shows all cycle test dates in the current term on a mini calendar
 - Colour-coded by grade
+- Confirmed grades shown with solid rose dates
+- Unconfirmed grades shown with dashed rose border
 
 **Changes take effect immediately for all users.**
 **Only Admins and Management can access this screen.**
@@ -2923,6 +3071,17 @@ List 10: ConfirmationLog
            IsStale (boolean, required, default: false),
            UnconfirmedAt (dateTime),
            UnconfirmedReason (text)
+
+List 11: CycleTestConfirmations
+  Columns: Grade (text, required),
+           Term (text, required),
+           IsConfirmed (boolean, required, default: false),
+           ConfirmedAt (dateTime),
+           ConfirmedBy (text),
+           CycleTestCount (number, required, default: 0),
+           IsStale (boolean, required, default: false),
+           UnconfirmedAt (dateTime),
+           UnconfirmedBy (text)
   # Note: Title auto-set by app. Total manually created columns = 10.
 ```
 
@@ -3136,7 +3295,7 @@ export const INITIAL_MOCK_DATA = {
     {
       id: "1", title: "Mathematics Mid-Term Test",
       subject: "Mathematics", classGroup: "Grade 10A",
-      assessmentType: "Cycle Test", assessmentDate: "2026-03-05",
+      assessmentType: "Class Test", assessmentDate: "2026-03-05",
       duration: 60, teacherName: "Mr Christopher Uren",
       teacherEmail: "c.uren@school.edu.za",
       term: "Term 1", studyRequired: "Requires Study",
@@ -3265,7 +3424,15 @@ export const INITIAL_MOCK_DATA = {
     { id: "15c", category: "ClassGroup",   title: "Grade 12A",        sortOrder: 10, active: true },
     { id: "15d", category: "ClassGroup",   title: "Grade 12B",        sortOrder: 11, active: true },
     { id: "15e", category: "ClassGroup",   title: "Grade 12C",        sortOrder: 12, active: true },
-    { id: "16", category: "AssessmentType", title: "Cycle Test",             sortOrder: 1, active: true },
+    // The following are the teacher-bookable types:
+    // Cycle Test is NOT here — it is managed via CycleTestManager only
+    { id: "16",  category: "AssessmentType", title: "Class Test",  abbreviation: "ClsT", icon: "pencil",     sortOrder: 1, active: true },
+    { id: "16b", category: "AssessmentType", title: "Quiz",        abbreviation: "Qz",   icon: "bolt",       sortOrder: 2, active: true },
+    { id: "16c", category: "AssessmentType", title: "Assignment",  abbreviation: "Asn",  icon: "paperclip",  sortOrder: 3, active: true },
+    { id: "16d", category: "AssessmentType", title: "Practical",   abbreviation: "Pr",   icon: "microscope", sortOrder: 4, active: true },
+    { id: "16e", category: "AssessmentType", title: "Oral",        abbreviation: "Or",   icon: "microphone", sortOrder: 5, active: true },
+    { id: "16f", category: "AssessmentType", title: "Project",     abbreviation: "Prj",  icon: "ruler",      sortOrder: 6, active: true },
+    { id: "16g", category: "AssessmentType", title: "Other",       abbreviation: "OT",   icon: "clipboard",  sortOrder: 7, active: true },
     { id: "17", category: "AssessmentType", title: "Quiz",             sortOrder: 2, active: true },
     { id: "18", category: "AssessmentType", title: "Assignment",       sortOrder: 3, active: true },
     { id: "19", category: "AssessmentType", title: "Practical",        sortOrder: 4, active: true },
@@ -3406,8 +3573,48 @@ export const INITIAL_MOCK_DATA = {
       unconfirmedReason: ""
     },
   ],
+  // ── LIST 11: CycleTestConfirmations ─────────────────────────────
+  // Mixed states to test all scenarios:
+  // Grade 10 confirmed, Grade 11 not confirmed, Grade 12 stale
+  cycleTestConfirmations: [
+    {
+      id: "1", title: "Grade 10 — Term 1 2026 — Cycle Test Schedule",
+      grade: "Grade 10", term: "Term 1 2026",
+      isConfirmed: true, confirmedAt: "2026-01-10T08:30:00Z",
+      confirmedBy: "Mr David van Wyk", cycleTestCount: 2,
+      isStale: false, unconfirmedAt: null, unconfirmedBy: ""
+    },
+    {
+      id: "2", title: "Grade 11 — Term 1 2026 — Cycle Test Schedule",
+      grade: "Grade 11", term: "Term 1 2026",
+      isConfirmed: false, confirmedAt: null,
+      confirmedBy: "", cycleTestCount: 1,
+      isStale: false, unconfirmedAt: null, unconfirmedBy: ""
+    },
+    {
+      id: "3", title: "Grade 12 — Term 1 2026 — Cycle Test Schedule",
+      grade: "Grade 12", term: "Term 1 2026",
+      isConfirmed: true, confirmedAt: "2026-01-10T08:35:00Z",
+      confirmedBy: "Mr David van Wyk", cycleTestCount: 1,
+      isStale: true, unconfirmedAt: null, unconfirmedBy: ""
+      // IsStale: new cycle test was added after confirmation
+    },
+    {
+      id: "4", title: "Grade 8 — Term 1 2026 — Cycle Test Schedule",
+      grade: "Grade 8", term: "Term 1 2026",
+      isConfirmed: true, confirmedAt: "2026-01-09T14:00:00Z",
+      confirmedBy: "Mr David van Wyk", cycleTestCount: 1,
+      isStale: false, unconfirmedAt: null, unconfirmedBy: ""
+    },
+    {
+      id: "5", title: "Grade 9 — Term 1 2026 — Cycle Test Schedule",
+      grade: "Grade 9", term: "Term 1 2026",
+      isConfirmed: false, confirmedAt: null,
+      confirmedBy: "", cycleTestCount: 1,
+      isStale: false, unconfirmedAt: null, unconfirmedBy: ""
+    },
+  ],
 };
-```
 
 **0b-5. Create `src/data/mockUsers.js` — mock user accounts for role testing**
 
@@ -3889,6 +4096,16 @@ checkCycleTestConflict(
 | 50 | Teacher changes date from a full day to a free day | Indicator immediately updates from red/rose to green — Save re-enables without page interaction |
 | 51 | Teacher changes Class/Group after selecting a full date | Indicator recalculates for the new class — may switch from red to green if new class has free slots |
 | 52 | Two teachers book simultaneously filling the last slot | Second teacher's save triggers ConflictWarning modal (server-side belt-and-braces) naming both conflicting assessments |
+| 53 | Teacher opens booking form for Grade 11 (cycle tests not confirmed) | Form is locked — date picker and class list disabled, banner: "Cycle tests for Grade 11 not yet confirmed" |
+| 54 | Teacher opens booking form for Grade 10 (cycle tests confirmed) | Form is fully interactive — no lock banner shown |
+| 55 | Teacher selects multiple classes (10A + 10B + 10C) and saves | Three separate assessment records created, one per class |
+| 56 | Teacher selects 10A + 10B where 10A already has 2 assessments that day | 10A skipped with warning, 10B saved successfully |
+| 57 | Management confirms Grade 11 cycle tests in CycleTestManager | All Grade 11 teachers immediately see confirmed notification on next interaction |
+| 58 | Management adds a cycle test after confirming Grade 10 | Grade 10 entry becomes stale, booking blocked with re-confirm warning |
+| 59 | Management re-confirms Grade 10 after editing cycle test | Booking re-opens immediately for Grade 10 teachers |
+| 60 | Teacher logs in with Grade 10 confirmed and Grade 11 not confirmed | Login banner shows green row for Grade 10, amber row for Grade 11 |
+| 61 | Teacher logs in with all grades confirmed | Single green banner, auto-dismisses after 5 seconds |
+| 62 | Management user logs in with unconfirmed grades | Red dot visible on Cycle Tests nav item |
 
 # ══════════════════════════════════════════════════════════════════
 # SECTION 12: THINGS TO CUSTOMISE BEFORE RUNNING CLAUDE CODE
